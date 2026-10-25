@@ -57,15 +57,22 @@ class Rule34Video :
         GET("$baseUrl/latest-updates/$page/")
     }
 
-    override fun popularAnimeSelector() = "div.item.thumb"
+    // The site now injects ad cards ("div.item.thumb" whose link points to an external
+    // ad network) between the real results, so only keep cards linking to /video/<id>/.
+    override fun popularAnimeSelector() = "div.item.thumb:has(a.th[href*=\"/video/\"])"
 
     override fun popularAnimeFromElement(element: Element) = SAnime.create().apply {
-        setUrlWithoutDomain(element.selectFirst("a.th")!!.attr("href"))
-        title = element.selectFirst("a.th div.thumb_title")!!.text()
-        thumbnail_url = element.selectFirst("a.th div.img img")?.attr("abs:data-original")
+        val link = element.selectFirst("a.th")!!
+        setUrlWithoutDomain(link.attr("href"))
+        title = link.attr("title").ifBlank { link.selectFirst("div.thumb_title")?.text().orEmpty() }
+        thumbnail_url = link.selectFirst("div.img img")?.let { img ->
+            // "data-original" lazy loading was removed; the real URL is now in "src".
+            img.absUrl("src").ifBlank { img.absUrl("data-rd-jpg") }.ifBlank { img.absUrl("data-original") }
+        }
     }
 
-    override fun popularAnimeNextPageSelector() = "div.item.pager.next a"
+    // New pager: <nav class="fs-pager"><a rel="next">; the legacy markup is kept as a fallback.
+    override fun popularAnimeNextPageSelector() = "nav.fs-pager a[rel=next], div.item.pager.next a"
 
     // =============================== Latest ===============================
     override fun latestUpdatesRequest(page: Int) = throw UnsupportedOperationException()
@@ -92,34 +99,62 @@ class Rule34Video :
         return super.getSearchAnime(page, query, filters)
     }
 
+    private inline fun <reified R : AnimeFilter.Text> AnimeFilterList.getText() = (find { it is R } as? AnimeFilter.Text)?.state?.trim().orEmpty()
+
+    private fun String.toSlug() = lowercase().replace(Regex("[^a-z0-9]+"), "-").trim('-')
+
     override fun searchAnimeRequest(page: Int, query: String, filters: AnimeFilterList): Request {
-        val orderFilter = filters.getUriPart<OrderFilter>()
-        val categoryFilter = filters.getUriPart<CategoryBy>()
-        val sortType = when (orderFilter) {
-            "latest-updates" -> "post_date"
-            "most-popular" -> "video_viewed"
-            "top-rated" -> "rating"
-            else -> ""
+        // OrderFilter values are the site's own "sort_by" values (verified from the sort menu).
+        val sortType = filters.getUriPart<OrderFilter>()
+        val typeId = filters.getUriPart<CategoryBy>()
+
+        if (query.startsWith(PREFIX_SEARCH)) {
+            val newQuery = query.removePrefix(PREFIX_SEARCH).dropLastWhile { it.isDigit() }
+            return GET("$baseUrl/search/$newQuery")
         }
 
-        val tagFilter = (filters.find { it is TagFilter } as? TagFilter)?.state ?: ""
+        // Tag / Artist / Category pages: https://rule34video.com/{tags|models|categories}/<slug>/<page>/
+        val browse = listOf(
+            "tags" to filters.getText<TagFilter>(),
+            "models" to filters.getText<ArtistFilter>(),
+            "categories" to filters.getText<CategoryNameFilter>(),
+        ).firstOrNull { it.second.isNotBlank() }
 
-        val url = "$baseUrl/search_ajax.php?tag=${tagFilter.ifBlank { "." }}"
-        val response = client.newCall(GET(url, headers)).execute()
-        tagDocument = response.asJsoup()
+        val urlBuilder = baseUrl.toHttpUrl().newBuilder().apply {
+            when {
+                browse != null -> {
+                    addPathSegment(browse.first)
+                    addPathSegment(browse.second.toSlug())
+                    if (page > 1) addPathSegment(page.toString())
+                    addPathSegment("")
+                }
 
-        val tagSearch = filters.getUriPart<TagSearch>()
+                // Text search is path based: /search/<query>/<page>/
+                query.isNotBlank() -> {
+                    addPathSegment("search")
+                    addPathSegment(query.trim().replace(Regex("\\s+"), "-"))
+                    if (page > 1) addPathSegment(page.toString())
+                    addPathSegment("")
+                }
 
-        return if (query.isNotEmpty()) {
-            if (query.startsWith(PREFIX_SEARCH)) {
-                val newQuery = query.removePrefix(PREFIX_SEARCH).dropLastWhile { it.isDigit() }
-                GET("$baseUrl/search/$newQuery")
-            } else {
-                GET("$baseUrl/search/${query.replace(Regex("\\s"), "-")}/?flag1=$categoryFilter&sort_by=$sortType&from_videos=$page&tag_ids=all%2C$tagSearch")
+                // Type only: /search/?...&from_videos=<page> (the list's page variable is "from_videos")
+                typeId.isNotEmpty() -> {
+                    addPathSegment("search")
+                    addPathSegment("")
+                    addQueryParameter("from_videos", page.toString())
+                }
+
+                else -> {
+                    addPathSegment("latest-updates")
+                    if (page > 1) addPathSegment(page.toString())
+                    addPathSegment("")
+                }
             }
-        } else {
-            GET("$baseUrl/search/?flag1=$categoryFilter&sort_by=$sortType&from_videos=$page&tag_ids=all%2C$tagSearch")
+            if (sortType.isNotEmpty()) addQueryParameter("sort_by", sortType)
+            // Legacy type parameter, still unverified on the redesigned site.
+            if (typeId.isNotEmpty() && browse == null) addQueryParameter("flag1", typeId)
         }
+        return GET(urlBuilder.build(), headers)
     }
 
     override fun searchAnimeSelector() = popularAnimeSelector()
@@ -128,57 +163,45 @@ class Rule34Video :
 
     // =========================== Anime Details ============================
     override fun animeDetailsParse(document: Document) = SAnime.create().apply {
-        title = document.selectFirst("h1.title_video")?.text().toString()
+        title = document.selectFirst("h1.title_video")?.text().orEmpty()
 
-        val infoRow = document.selectFirst("div.info.row")
         val detailRows = document.select("div.row")
+        val meta = document.select("div.vp-meta span.item_info > span").eachText()
 
-        val artistElement = detailRows.select("div.col:has(div.label:contains(Artist)) a.item span.name").firstOrNull()
-        author = artistElement?.text().orEmpty()
+        author = detailRows.select("div.col:has(div.label:contains(Artist)) a.item span.name")
+            .firstOrNull()?.text().orEmpty()
 
         description = buildString {
-            detailRows.select("div.row:has(div.label > em) > div.label > em").html()
-                .replace("<br>", "\n") // Ensure single <br> tags are followed by a newline
-                .let { text ->
-                    append(text)
-                }
-            append("\n\n") // Add extra spacing
-
-            infoRow?.selectFirst("div.item_info:nth-child(1) > span")?.text()?.let {
-                append("Uploaded: $it\n")
+            document.selectFirst("div.vp-desc")?.text()?.takeIf { it.isNotBlank() }?.let {
+                append(it)
+                append("\n\n")
             }
+
+            meta.getOrNull(0)?.let { append("Uploaded: $it\n") }
 
             val artist = detailRows.select("div.col:has(div.label:contains(Artist)) a.item span.name")
                 .eachText()
                 .joinToString()
-            if (artist.isNotEmpty()) {
-                append("Artists: $artist\n")
-            }
+            if (artist.isNotEmpty()) append("Artists: $artist\n")
 
             val categories = detailRows.select("div.col:has(div.label:contains(Categories)) a.item span")
                 .eachText()
                 .joinToString()
-            if (categories.isNotEmpty()) {
-                append("Categories: $categories\n")
-            }
+            if (categories.isNotEmpty()) append("Categories: $categories\n")
 
             val uploader = detailRows.select("div.col:has(div.label:contains(Uploaded by)) a.item").text()
-            if (uploader.isNotEmpty()) {
-                append("Uploader: $uploader\n")
-            }
+            if (uploader.isNotEmpty()) append("Uploader: $uploader\n")
 
-            infoRow?.select("div.item_info:nth-child(2) > span")?.text()?.let {
-                val views = it.substringBefore(" ").replace(",", "")
-                append("Views: $views\n")
-            }
-            infoRow?.select("div.item_info:nth-child(3) > span")?.text()?.let { append("Duration: $it\n") }
-            document.select("div.row:has(div.label:contains(Download)) a.tag_item")
-                .eachText()
-                .joinToString { it.substringAfter(" ") }
-                .also { append("Quality: $it") }
-        }
+            meta.getOrNull(1)?.let { append("Views: $it\n") }
+            meta.getOrNull(2)?.let { append("Duration: $it\n") }
 
-        genre = document.select("div.row_spacer:has(div.label:contains(Tags)) a.tag_item:not(:contains(Suggest))")
+            val qualities = document.select(DOWNLOAD_LINK_SELECTOR)
+                .mapNotNull { QUALITY_REGEX.find(it.text())?.value }
+                .joinToString()
+            if (qualities.isNotEmpty()) append("Quality: $qualities")
+        }.trim()
+
+        genre = document.select("div.vp-tags a.tag_item")
             .eachText()
             .joinToString()
 
@@ -221,27 +244,62 @@ class Rule34Video :
 
         val document = response.asJsoup()
 
-        return document.select("div.label:contains(Download) ~ a.tag_item")
-            .mapNotNull { element ->
-                val originalUrl = element.attr("href")
-                // We need to do that because this url returns a http 403 error
-                // if you try to connect using http/1.1, which is the protocol
-                // that the player uses. OkHttp uses http/2 by default, so we
-                // fetch the video url first via okhttp and then pass it for the player.
-                val url = noRedirectClient.newCall(GET(originalUrl, headers)).execute()
-                    .use { it.headers["location"] }
-                    ?: return@mapNotNull null
-                val quality = element.text().substringAfter(" ")
-                Video(url, quality, url, headers)
-            }
+        // 1) The player's own sources (flashvars in an inline script): video_url, video_alt_url, video_alt_url2...
+        // 2) Fallback: the links inside the new "Download" sheet.
+        val sources = parseFlashvarsSources(document).ifEmpty { parseDownloadSheetSources(document) }
+
+        return sources.mapNotNull { (quality, originalUrl) ->
+            // The file server returns a http 403 when the player (http/1.1) connects to the
+            // tokenised url directly, so resolve the redirect target with OkHttp (http/2) first.
+            val url = resolveRedirect(originalUrl, headers)
+            Video(url, quality, url, headers)
+        }
     }
+
+    private fun parseFlashvarsSources(document: Document): List<Pair<String, String>> {
+        val script = document.select("script")
+            .map { it.data() }
+            .firstOrNull { "flashvars" in it && "video_url" in it }
+            ?: return emptyList()
+
+        return FLASHVARS_URL_REGEX.findAll(script).mapNotNull { match ->
+            val key = match.groupValues[1]
+            val url = match.groupValues[2].replace("\\/", "/")
+            val quality = Regex("""${key}_text:\s*'([^']+)'""").find(script)?.groupValues?.get(1)
+                ?: QUALITY_REGEX.find(url)?.value
+                ?: return@mapNotNull null
+            quality to url
+        }.toList()
+    }
+
+    private fun parseDownloadSheetSources(document: Document): List<Pair<String, String>> = document.select(DOWNLOAD_LINK_SELECTOR).mapNotNull { element ->
+        val quality = QUALITY_REGEX.find(element.text())?.value ?: return@mapNotNull null
+        val href = element.absUrl("href").takeIf { it.isNotBlank() } ?: return@mapNotNull null
+        // Drop the "force download" parameters so the file can be streamed.
+        val url = href.toHttpUrl().newBuilder()
+            .removeAllQueryParameters("download")
+            .removeAllQueryParameters("download_filename")
+            .build()
+            .toString()
+        quality to url
+    }
+
+    private fun resolveRedirect(url: String, headers: okhttp3.Headers): String = runCatching {
+        noRedirectClient.newCall(GET(url, headers)).execute().use { res ->
+            if (res.isRedirect) {
+                res.header("location")?.let { res.request.url.resolve(it)?.toString() } ?: url
+            } else {
+                url
+            }
+        }
+    }.getOrDefault(url)
 
     override fun videoListSelector() = throw UnsupportedOperationException()
 
     override fun videoFromElement(element: Element) = throw UnsupportedOperationException()
 
     override fun List<Video>.sortVideos(): List<Video> {
-        val quality = preferences.getString("preferred_quality", "720p") ?: return this
+        val quality = preferences.getString(PREF_QUALITY_KEY, PREF_QUALITY_DEFAULT) ?: return this
         return sortedWith(compareByDescending { it.videoTitle == quality })
     }
 
@@ -282,20 +340,6 @@ class Rule34Video :
     }
 
     // ============================== Filters ===============================
-    private var tagDocument = Document("")
-
-    private fun tagsResults(document: Document): Array<Pair<String, String>> {
-        val tagList = mutableListOf(Pair("<Select>", ""))
-        tagList.addAll(
-            document.select("div.item").map {
-                val tagValue = it.selectFirst("input")!!.attr("value")
-                val tagName = it.selectFirst("label")!!.text()
-                Pair(tagName, tagValue)
-            },
-        )
-        return tagList.toTypedArray()
-    }
-
     override fun getFilterList(): AnimeFilterList = if (preferences.getBoolean(PREF_UPLOADER_FILTER_ENABLED_KEY, false) &&
         preferences.getString(PREF_UPLOADER_ID_KEY, "")?.isNotBlank() == true
     ) {
@@ -305,23 +349,23 @@ class Rule34Video :
             OrderFilter(),
             CategoryBy(),
             AnimeFilter.Separator(),
-            AnimeFilter.Header("Entered a \"tag\", click on \"filter\" then Click \"reset\" to load tags."),
+            AnimeFilter.Header("Browse by name (ignores the search text, first filled field wins):"),
+            AnimeFilter.Header("Type it as shown on the site, e.g. \"kanae katagiri (bleach)\""),
             TagFilter(),
-            TagSearch(tagsResults(tagDocument)),
+            ArtistFilter(),
+            CategoryNameFilter(),
         )
     }
 
-    private class TagFilter : AnimeFilter.Text("Click \"reset\" without any text to load all A-Z tags.", "")
+    private class TagFilter : AnimeFilter.Text("Tag", "")
 
-    private class TagSearch(results: Array<Pair<String, String>>) :
-        UriPartFilter(
-            "Tag Filter ",
-            results,
-        )
+    private class ArtistFilter : AnimeFilter.Text("Artist", "")
+
+    private class CategoryNameFilter : AnimeFilter.Text("Category (series/game)", "")
 
     private class CategoryBy :
         UriPartFilter(
-            "Category Filter ",
+            "Type ",
             arrayOf(
                 Pair("All", ""),
                 Pair("Straight", "2109"),
@@ -336,9 +380,12 @@ class Rule34Video :
         UriPartFilter(
             "Sort By ",
             arrayOf(
-                Pair("Latest", "latest-updates"),
-                Pair("Most Viewed", "most-popular"),
-                Pair("Top Rated", "top-rated"),
+                Pair("Default (Newest / Relevance)", ""),
+                Pair("Newest", "post_date"),
+                Pair("Most Viewed", "video_viewed"),
+                Pair("Top Rated", "rating"),
+                Pair("Longest", "duration"),
+                Pair("Random", "pseudo_rand"),
             ),
         )
 
@@ -348,6 +395,10 @@ class Rule34Video :
 
     companion object {
         const val PREFIX_SEARCH = "slug:"
+
+        private const val DOWNLOAD_LINK_SELECTOR = "div.vp-sheet[data-sheet=download] a.tag_item_download"
+        private val QUALITY_REGEX = Regex("""\d{3,4}p""")
+        private val FLASHVARS_URL_REGEX = Regex("""(video(?:_alt)?_url\d*):\s*'(https?:[^']+)'""")
 
         private const val PREF_QUALITY_KEY = "preferred_quality"
         private const val PREF_QUALITY_TITLE = "Preferred quality"
